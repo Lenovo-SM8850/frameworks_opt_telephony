@@ -4208,8 +4208,11 @@ public class GsmCdmaPhone extends Phone {
 
         logd("reapplyUiccAppsEnablementIfNeeded: retries=" + retries + ", subInfo=" + info);
 
-        // If info is null, it could be a new subscription. By default we enable it.
-        boolean expectedValue = info == null || info.areUiccApplicationsEnabled();
+        // Honor the built-in SIM default even before its subscription record is inserted.
+        boolean builtinDataSim = !slot.isEuicc() && Arrays.stream(mContext.getResources()
+                .getIntArray(com.android.internal.R.array.config_builtinDataSimSlots))
+                .anyMatch(slotIndex -> slotIndex == mPhoneId);
+        boolean expectedValue = info == null ? !builtinDataSim : info.areUiccApplicationsEnabled();
 
         // If for any reason current state is different from configured state, re-apply the
         // configured state.
