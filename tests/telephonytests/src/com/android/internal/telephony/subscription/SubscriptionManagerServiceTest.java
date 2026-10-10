@@ -85,6 +85,7 @@ import android.app.AppOpsManager;
 import android.app.PropertyInvalidatedCache;
 import android.compat.testing.PlatformCompatChangeRule;
 import android.content.ContentValues;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.Uri;
@@ -224,6 +225,11 @@ public class SubscriptionManagerServiceTest extends TelephonyTest {
         mContextFixture.putBooleanResource(com.android.internal.R.bool
                 .config_subscription_database_async_update, true);
         mContextFixture.putIntArrayResource(com.android.internal.R.array.sim_colors, new int[0]);
+        mContextFixture.putIntArrayResource(com.android.internal.R.array.config_builtinDataSimSlots,
+                new int[0]);
+        mContext.getSharedPreferences("builtin_data_sims", Context.MODE_PRIVATE).edit()
+                .remove("iccids")
+                .commit();
         mContextFixture.putResource(com.android.internal.R.string.default_card_name,
                 FAKE_DEFAULT_CARD_NAME);
 
@@ -3179,6 +3185,141 @@ public class SubscriptionManagerServiceTest extends TelephonyTest {
         SubscriptionInfoInternal subInfo = mSubscriptionManagerServiceUT
                 .getSubscriptionInfoInternal(1);
         assertThat(subInfo.areUiccApplicationsEnabled()).isTrue();
+    }
+
+    private void configureBuiltinDataSim() {
+        mContextFixture.putIntArrayResource(com.android.internal.R.array.config_builtinDataSimSlots,
+                new int[]{0});
+        doReturn(false).when(mUiccSlot).isEuicc();
+        doReturn(TelephonyManager.INVALID_PORT_INDEX).when(mUiccSlot)
+                .getPortIndexFromIccId(anyString());
+        mContextFixture.addCallingOrSelfPermission(Manifest.permission.MODIFY_PHONE_STATE);
+        mContextFixture.addCallingOrSelfPermission(Manifest.permission.READ_PRIVILEGED_PHONE_STATE);
+    }
+
+    @Test
+    @EnableCompatChanges({TelephonyManager.ENABLE_FEATURE_MAPPING})
+    public void testBuiltinDataSimInsertedDisabled() {
+        configureBuiltinDataSim();
+        mSubscriptionManagerServiceUT.updateSimState(
+                0, TelephonyManager.SIM_STATE_READY, null, null);
+        processAllMessages();
+        assertThat(mSubscriptionManagerServiceUT.getSubscriptionInfoInternal(1)
+                .areUiccApplicationsEnabled()).isFalse();
+        verify(mMockedSubscriptionManagerServiceCallback).onUiccApplicationsEnabledChanged(1);
+
+        // Returning to READY must preserve an explicit user enablement.
+        mSubscriptionManagerServiceUT.setUiccApplicationsEnabled(true, 1);
+        processAllMessages();
+        mSubscriptionManagerServiceUT.updateSimState(
+                0, TelephonyManager.SIM_STATE_READY, null, null);
+        processAllMessages();
+        assertThat(mSubscriptionManagerServiceUT.getSubscriptionInfoInternal(1)
+                .areUiccApplicationsEnabled()).isTrue();
+    }
+
+    @Test
+    @EnableCompatChanges({TelephonyManager.ENABLE_FEATURE_MAPPING})
+    public void testBuiltinDataSimInsertedNotReady() {
+        configureBuiltinDataSim();
+        mSubscriptionManagerServiceUT.updateSimState(
+                0, TelephonyManager.SIM_STATE_NOT_READY, null, null);
+        processAllMessages();
+        SubscriptionInfoInternal subInfo = mSubscriptionManagerServiceUT
+                .getSubscriptionInfoInternal(1);
+        assertThat(subInfo.areUiccApplicationsEnabled()).isFalse();
+        assertThat(subInfo.getSimSlotIndex()).isEqualTo(SubscriptionManager.INVALID_SIM_SLOT_INDEX);
+        verify(mMockedSubscriptionManagerServiceCallback).onUiccApplicationsEnabledChanged(1);
+    }
+
+    @Test
+    @EnableCompatChanges({TelephonyManager.ENABLE_FEATURE_MAPPING})
+    public void testBuiltinDataSimInsertedWithoutUiccPort() {
+        configureBuiltinDataSim();
+        doReturn(null).when(mUiccController).getUiccPort(0);
+        doReturn(FAKE_ICCID1).when(mUiccSlot).getIccId(anyInt());
+        mSubscriptionManagerServiceUT.updateSimState(
+                0, TelephonyManager.SIM_STATE_NOT_READY, null, null);
+        processAllMessages();
+        SubscriptionInfoInternal subInfo = mSubscriptionManagerServiceUT
+                .getSubscriptionInfoInternal(1);
+        assertThat(subInfo.getIccId()).isEqualTo(FAKE_ICCID1);
+        assertThat(subInfo.areUiccApplicationsEnabled()).isFalse();
+    }
+
+    @Test
+    @EnableCompatChanges({TelephonyManager.ENABLE_FEATURE_MAPPING})
+    public void testBuiltinDataSimAbsentRetainsSettingWithoutSlot() {
+        configureBuiltinDataSim();
+        mSubscriptionManagerServiceUT.updateSimState(
+                0, TelephonyManager.SIM_STATE_NOT_READY, null, null);
+        processAllMessages();
+        // The persistent ICCID association is needed when both slot and port are unknown.
+        doReturn(null).when(mUiccPort).getIccId();
+        doReturn(null).when(mUiccSlot).getIccId(anyInt());
+        doReturn(IccCardStatus.CardState.CARDSTATE_ABSENT).when(mUiccSlot).getCardState();
+        mSubscriptionManagerServiceUT.updateSimState(
+                0, TelephonyManager.SIM_STATE_ABSENT, null, null);
+        processAllMessages();
+        mSubscriptionManagerServiceUT.updateSimState(
+                1, TelephonyManager.SIM_STATE_ABSENT, null, null);
+        processAllMessages();
+        assertThat(mSubscriptionManagerServiceUT.getSubscriptionInfoInternal(1)
+                .areUiccApplicationsEnabled()).isFalse();
+        assertThat(mContext.getSharedPreferences("builtin_data_sims", Context.MODE_PRIVATE)
+                .getStringSet("iccids", Set.of())).contains(FAKE_ICCID1);
+
+        mSubscriptionManagerServiceUT.setUiccApplicationsEnabled(true, 1);
+        processAllMessages();
+        mSubscriptionManagerServiceUT.updateSimState(
+                0, TelephonyManager.SIM_STATE_ABSENT, null, null);
+        processAllMessages();
+        assertThat(mSubscriptionManagerServiceUT.getSubscriptionInfoInternal(1)
+                .areUiccApplicationsEnabled()).isTrue();
+    }
+
+    @Test
+    @EnableCompatChanges({TelephonyManager.ENABLE_FEATURE_MAPPING})
+    public void testBuiltinDataSimInactivePortRetainsSetting() {
+        configureBuiltinDataSim();
+        insertSubscription(FAKE_SUBSCRIPTION_INFO1);
+        mSubscriptionManagerServiceUT.setUiccApplicationsEnabled(false, 1);
+        processAllMessages();
+        mSubscriptionManagerServiceUT.updateSimStateForInactivePort(0, FAKE_ICCID1);
+        processAllMessages();
+        assertThat(mSubscriptionManagerServiceUT.getSubscriptionInfoInternal(1)
+                .areUiccApplicationsEnabled()).isFalse();
+
+        mSubscriptionManagerServiceUT.setUiccApplicationsEnabled(true, 1);
+        processAllMessages();
+        mSubscriptionManagerServiceUT.updateSimStateForInactivePort(0, FAKE_ICCID1);
+        processAllMessages();
+        assertThat(mSubscriptionManagerServiceUT.getSubscriptionInfoInternal(1)
+                .areUiccApplicationsEnabled()).isTrue();
+    }
+
+    @Test
+    @EnableCompatChanges({TelephonyManager.ENABLE_FEATURE_MAPPING})
+    public void testBuiltinDataSimInactiveInsertion() {
+        configureBuiltinDataSim();
+        mSubscriptionManagerServiceUT.updateSimStateForInactivePort(0, FAKE_ICCID1);
+        processAllMessages();
+        SubscriptionInfoInternal subInfo = mSubscriptionManagerServiceUT
+                .getSubscriptionInfoInternal(1);
+        assertThat(subInfo.areUiccApplicationsEnabled()).isFalse();
+        assertThat(subInfo.getSimSlotIndex()).isEqualTo(SubscriptionManager.INVALID_SIM_SLOT_INDEX);
+    }
+
+    @Test
+    @EnableCompatChanges({TelephonyManager.ENABLE_FEATURE_MAPPING})
+    public void testBuiltinDataSimConfigDoesNotDisableEmbeddedSim() {
+        configureBuiltinDataSim();
+        doReturn(true).when(mUiccSlot).isEuicc();
+        mSubscriptionManagerServiceUT.updateSimState(
+                0, TelephonyManager.SIM_STATE_READY, null, null);
+        processAllMessages();
+        assertThat(mSubscriptionManagerServiceUT.getSubscriptionInfoInternal(1)
+                .areUiccApplicationsEnabled()).isTrue();
     }
 
     @Test

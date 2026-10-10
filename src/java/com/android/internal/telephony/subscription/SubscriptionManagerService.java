@@ -37,6 +37,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.Resources;
 import android.net.Uri;
@@ -1393,6 +1394,9 @@ public class SubscriptionManagerService extends ISub.Stub {
         mSubscriptionDatabaseManager.getAllSubscriptions().stream()
                 .filter(subInfo -> subInfo.getSimSlotIndex() == simSlotIndex)
                 .forEach(subInfo -> {
+                    if (!subInfo.isEmbedded()) {
+                        isBuiltinDataSim(subInfo.getIccId(), simSlotIndex);
+                    }
                     mSubscriptionDatabaseManager.setSimSlotIndex(subInfo.getSubscriptionId(),
                             SubscriptionManager.INVALID_SIM_SLOT_INDEX);
                     // Sometime even though slot-port is inactive, proper iccid will be present,
@@ -1456,6 +1460,37 @@ public class SubscriptionManagerService extends ISub.Stub {
     }
 
     /**
+     * Remember built-in physical SIMs before their logical slot and port become invalid.
+     * Persist the ICCIDs in device-protected storage so an early ABSENT event after a service
+     * restart cannot undo the user's setting.
+     */
+    private boolean isBuiltinDataSim(@NonNull String iccId, int slotIndex) {
+        int[] builtinSlots = mContext.getResources().getIntArray(R.array.config_builtinDataSimSlots);
+        if (builtinSlots.length == 0 || TextUtils.isEmpty(iccId)) return false;
+        String strippedIccId = getStrippedIccid(iccId);
+        SharedPreferences preferences = mContext.createDeviceProtectedStorageContext()
+                .getSharedPreferences("builtin_data_sims", Context.MODE_PRIVATE);
+        Set<String> iccIds = preferences.getStringSet("iccids", Collections.emptySet());
+        if (iccIds.contains(strippedIccId)) return true;
+        for (int builtinSlot : builtinSlots) {
+            if (!SubscriptionManager.isValidSlotIndex(builtinSlot)) continue;
+            UiccSlot slot = mUiccController.getUiccSlotForPhone(builtinSlot);
+            if ((slot == null || !slot.isEuicc()) && (builtinSlot == slotIndex
+                    || (slot != null && slot.getPortIndexFromIccId(strippedIccId)
+                    != TelephonyManager.INVALID_PORT_INDEX))) {
+                Set<String> updatedIccIds = new ArraySet<>(iccIds);
+                updatedIccIds.add(strippedIccId);
+                // Save before clearing the database slot, including across an immediate restart.
+                if (!preferences.edit().putStringSet("iccids", updatedIccIds).commit()) {
+                    loge("Failed to persist built-in data SIM ICCID association");
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Insert a new subscription into the database.
      *
      * @param iccId The ICCID.
@@ -1481,7 +1516,19 @@ public class SubscriptionManagerService extends ISub.Stub {
             builder.setDisplayName(displayName);
         }
 
+        boolean builtinDataSim = subscriptionType == SubscriptionManager.SUBSCRIPTION_TYPE_LOCAL_SIM
+                && isBuiltinDataSim(iccId, slotIndex);
+        if (builtinDataSim) {
+            // Set the default only on insertion. Subsequent user changes remain authoritative.
+            builder.setUiccApplicationsEnabled(0)
+                    .setSimSlotIndex(SubscriptionManager.INVALID_SIM_SLOT_INDEX);
+        }
         int subId = mSubscriptionDatabaseManager.insertSubscriptionInfo(builder.build());
+        if (builtinDataSim) {
+            // Use the phone's existing reapply path to send the inserted default to the modem.
+            mSubscriptionManagerServiceCallbacks.forEach(callback -> callback.invokeFromExecutor(
+                    () -> callback.onUiccApplicationsEnabledChanged(subId)));
+        }
         logl("insertSubscriptionInfo: Inserted a new subscription. subId=" + subId
                 + ", slotIndex=" + slotIndex + ", iccId=" + SubscriptionInfo.getPrintableId(iccId)
                 + ", displayName=" + displayName + ", type="
@@ -1785,6 +1832,26 @@ public class SubscriptionManagerService extends ISub.Stub {
             }
         }
 
+        String currentIccId = getIccId(phoneId);
+        UiccSlot currentSlot = mUiccController.getUiccSlotForPhone(phoneId);
+        if (TextUtils.isEmpty(currentIccId) && currentSlot != null && !currentSlot.isEuicc()) {
+            // The slot status can expose ICCID before a UiccPort exists for a disabled SIM.
+            String slotIccId = currentSlot.getIccId(currentSlot.getPortIndexFromPhoneId(phoneId));
+            if (!TextUtils.isEmpty(slotIccId)) currentIccId = getStrippedIccid(slotIccId);
+        }
+        if (currentSlot != null && !currentSlot.isEuicc()
+                && isBuiltinDataSim(currentIccId, phoneId)
+                && simState == TelephonyManager.SIM_STATE_NOT_READY
+                && mSubscriptionDatabaseManager.getSubscriptionInfoInternalByIccId(currentIccId)
+                == null) {
+            // A disabled SIM may never reach LOADED. Record its default as soon as ICCID is known.
+            int subId = insertSubscriptionInfo(currentIccId, phoneId, null,
+                    SubscriptionManager.SUBSCRIPTION_TYPE_LOCAL_SIM);
+            mSubscriptionDatabaseManager.setDisplayName(subId,
+                    mContext.getResources().getString(R.string.default_card_name,
+                            getCardNumber(subId)));
+        }
+
         if (simState == TelephonyManager.SIM_STATE_ABSENT) {
             SatelliteController satelliteController = SatelliteController.getInstance();
             boolean isSatelliteEnabledOrBeingEnabled = false;
@@ -1802,8 +1869,11 @@ public class SubscriptionManagerService extends ISub.Stub {
                                 && !subInfo.isEmbedded())
                         .forEach(subInfo -> {
                             int subId = subInfo.getSubscriptionId();
-                            log("updateSubscription: Re-enable Uicc application on sub " + subId);
-                            mSubscriptionDatabaseManager.setUiccApplicationsEnabled(subId, true);
+                            // Built-in SIMs retain the user's choice even when the modem resets.
+                            if (!isBuiltinDataSim(subInfo.getIccId(), subInfo.getSimSlotIndex())) {
+                                log("updateSubscription: Re-enable Uicc application on sub " + subId);
+                                mSubscriptionDatabaseManager.setUiccApplicationsEnabled(subId, true);
+                            }
                             // When sim is absent, set the port index to invalid port index.
                             // (pre-U behavior)
                             mSubscriptionDatabaseManager.setPortIndex(subId,
@@ -5054,11 +5124,17 @@ public class SubscriptionManagerService extends ISub.Stub {
             if (mSlotIndexToSubId.containsKey(slotIndex)) {
                 // Re-enable the UICC application , so it will be in enabled state when it becomes
                 // active again. (Pre-U behavior)
-                mSubscriptionDatabaseManager.setUiccApplicationsEnabled(
-                        mSlotIndexToSubId.get(slotIndex), true);
+                SubscriptionInfoInternal subInfo = mSubscriptionDatabaseManager
+                        .getSubscriptionInfoInternal(mSlotIndexToSubId.get(slotIndex));
+                if (subInfo != null && (subInfo.isEmbedded()
+                        || !isBuiltinDataSim(subInfo.getIccId(), slotIndex))) {
+                    mSubscriptionDatabaseManager.setUiccApplicationsEnabled(
+                            subInfo.getSubscriptionId(), true);
+                }
                 updateSubscription(slotIndex);
             }
             if (!TextUtils.isEmpty(iccId)) {
+                isBuiltinDataSim(iccId, slotIndex);
                 // When port is inactive, sometimes valid iccid is present in the slot status,
                 // hence update the portIndex. (Pre-U behavior)
                 SubscriptionInfoInternal subInfo = mSubscriptionDatabaseManager
