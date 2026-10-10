@@ -153,6 +153,8 @@ public class GsmCdmaPhoneTest extends TelephonyTest {
     @Before
     public void setUp() throws Exception {
         super.setUp(getClass().getSimpleName());
+        mContextFixture.putIntArrayResource(com.android.internal.R.array.config_builtinDataSimSlots,
+                new int[0]);
         mPreTestProperties = DeviceConfig.getProperties(
                 TelephonyManager.PROPERTY_ENABLE_NULL_CIPHER_TOGGLE);
         mTestHandler = mock(Handler.class);
@@ -1179,6 +1181,23 @@ public class GsmCdmaPhoneTest extends TelephonyTest {
         moveTimeForward(5000);
         processAllMessages();
         verify(mMockCi, times(1)).enableUiccApplications(eq(true), any());
+    }
+
+    @Test
+    @SmallTest
+    public void testReapplyBuiltinDataSimBeforeSubscriptionInsertion() {
+        mContextFixture.putIntArrayResource(com.android.internal.R.array.config_builtinDataSimSlots,
+                new int[]{0});
+        mPhoneUT.mCi = mMockCi;
+        doReturn(mUiccSlot).when(mUiccController).getUiccSlotForPhone(anyInt());
+        doReturn(false).when(mUiccSlot).isEuicc();
+        doReturn(IccCardStatus.CardState.CARDSTATE_PRESENT).when(mUiccSlot).getCardState();
+        doReturn("Fake iccId").when(mUiccSlot).getIccId(anyInt());
+        Message.obtain(mPhoneUT, EVENT_UICC_APPS_ENABLEMENT_STATUS_CHANGED,
+                new AsyncResult(null, true, null)).sendToTarget();
+        processAllMessages();
+        verify(mMockCi).enableUiccApplications(eq(false), any());
+        verify(mMockCi, never()).enableUiccApplications(eq(true), any());
     }
 
     @Test
